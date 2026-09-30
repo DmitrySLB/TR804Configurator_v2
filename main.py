@@ -1218,7 +1218,6 @@ class SynapseDevice:
 
         current_row = 0
 
-        #layout_controls_tab_4.addWidget(QLabel("Filename: "), current_row, 0,Qt.AlignmentFlag.AlignLeft)
         layout_controls_tab_4.addWidget(self.LabelFileName, current_row, 0, 1, 6,Qt.AlignmentFlag.AlignLeft)
 
         current_row += 1
