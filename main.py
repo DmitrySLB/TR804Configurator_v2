@@ -12,6 +12,7 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, Qt, QThread, QMutex, QWa
 from PyQt6.QtGui import QFont, QIntValidator,QValidator, QPalette, QColor
 import paramiko
 from paramiko.channel import Channel
+import socket
 import time
 import yaml
 import json
@@ -31,12 +32,17 @@ class InteractiveSSHWorker(QObject):
     request_decision = pyqtSignal(DialogResult,str,str)
     update_entry = pyqtSignal(dict)
     finished_signal = pyqtSignal()  # Вызывается только при полном отключении
+    device_status_signal = pyqtSignal(str,str)
 
     def __init__(self,host,port,jump_flag,jump_host,jump_port,jump_user,jump_pass,user,secret):
         super().__init__()
         self.task_queue = queue.Queue()
         self.is_running = True
         self.ssh_connected = False
+        self.synapse_device_status = ''
+        self.dma_driver_status = ''
+        self.synapse = 'synapse-device'
+        self.dma_driver = 'synapse-dma-audio-driver'
 
         self.jump_client = paramiko.SSHClient()
         self.jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -297,9 +303,9 @@ class InteractiveSSHWorker(QObject):
             self.sftpTransport.close()
             self.send_log_string(f"Closed sFTP", False)
 
-    def add_task(self, task_name):
+    def add_task(self, task_name,**kwargs):
         """Метод вызывается из GUI-потока для добавления задачи в очередь"""
-        self.task_queue.put(task_name)
+        self.task_queue.put((task_name,kwargs))
 
     def stop(self):
         """Метод для полной остановки потока при дисконнекте"""
@@ -322,13 +328,13 @@ class InteractiveSSHWorker(QObject):
             try:
                 # Поток блокируется (спит) здесь, пока в очереди ничего нет.
                 # timeout нужен, чтобы поток мог периодически проверять флаг self.is_running
-                task = self.task_queue.get(timeout=1.0)
+                task, kwargs = self.task_queue.get(timeout=1.0)
 
                 if task == "EXIT":
                     break
 
                 # Обработка команд
-                self.execute_command(task)
+                self.execute_command(task,kwargs=kwargs)
 
                 # Сообщаем очереди, что задача успешно обработана
                 self.task_queue.task_done()
@@ -352,59 +358,76 @@ class InteractiveSSHWorker(QObject):
     def send_log_string(self,text,change_last_line = False):
         self.log_signal.emit(text,change_last_line)
 
-    def execute_command(self, task):
-        """Здесь выполняются команды. Пока метод не завершится,
-        следующая задача из очереди не возьмется!"""
+    def execute_command(self, task, kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if self.check_connected():
+            try:
+                if task == "read_settings":
+                    self.get_device_settings()
 
-        if task == "read_settings":
-            self.get_device_settings()
+                elif task == "update_start":
+                    self.send_log_string("Update start.")
 
-        elif task == "update_start":
-            self.send_log_string("Update start.")
+                elif task == "update_finish":
+                    self.send_log_string("Update finish. Reboot is needed")
 
-        elif task == "update_finish":
-            self.send_log_string("Update finish. Reboot is needed")
+                elif task == "restart_service":
+                    self.send_log_string("Service is restarting...")
+                    self.send_command('systemctl restart synapse-device',True)
+                    self.add_task("status_service")
 
-        elif task == "restart_service":
-            self.send_log_string("Service is restarting...")
-            self.send_command('systemctl restart synapse-device',True)
-            self.add_task("status_service")
+                elif task == "stop_service":
+                    self.send_log_string("Service is stoping...")
+                    self.send_command('systemctl stop synapse-device',True)
+                    self.add_task("status_service")
 
-        elif task == "stop_service":
-            self.send_log_string("Service is stoping...")
-            self.send_command('systemctl stop synapse-device',True)
-            self.add_task("status_service")
+                elif task == "status_service":
+                    status = self.send_command('systemctl status synapse-device | grep "Active:"',True).strip()
+                    self.send_log_string(status)
 
-        elif task == "status_service":
-            status = self.send_command('systemctl status synapse-device | grep "Active:"',True).strip()
-            self.send_log_string(status)
+                elif task == "reboot_device":
+                    self.send_log_string(f"Checking FS before reboot. Please wait")
+                    self.send_command("rm /home/ubuntu/partition_extended", False)
+                    self.send_command("mount -o remount,ro /", True)
+                    self.send_command("fsck -y /dev/mmcblk0p2", True)
+                    self.send_log_string(f"Rebooting")
+                    self.send_command("reboot", True)
+                    self.add_task("EXIT")
 
-        elif task == "reboot_device":
-            self.send_log_string(f"Checking FS before reboot. Please wait")
-            self.send_command("rm /home/ubuntu/partition_extended", False)
-            self.send_command("mount -o remount,ro /", True)
-            self.send_command("fsck -y /dev/mmcblk0p2", True)
-            self.send_log_string(f"Rebooting")
-            self.send_command("reboot", True)
-            self.add_task("EXIT")
+                elif task == "update_netplan":
+                    self.update_netplan()
 
-        elif task == "update_netplan":
-            self.update_netplan()
+                elif task == "update_chrony":
+                    self.update_chrony()
 
-        elif task == "update_chrony":
-            self.update_chrony()
+                elif task == "update_device_config":
+                    self.update_device_config()
 
-        elif task == "update_device_config":
-            self.update_device_config()
+                elif task == "repair_partition":
+                    self.send_log_string(f"Start repair root partition.")
+                    self.send_command(f"rm /home/ubuntu/partition_extended")
+                    cmd = f"bash -c 'mount -o remount,ro / ; e2fsck -f -y /dev/mmcblk0p2 ; mount -o remount,rw /'"
+                    self.send_command(cmd, True)
+                    cmd = f"bash -c 'growpart /dev/mmcblk0 2 -v -u off ; partx -u /dev/mmcblk0 ; resize2fs /dev/mmcblk0p2'"
+                    self.send_command(cmd, True)
+                    self.send_log_string(f"Finish repair root partition.")
 
-        elif task == "repair_partition":
-            self.send_log_string(f"Start repair root partition.")
-            self.send_command(f"rm /home/ubuntu/partition_extended")
-            cmd = f"bash -c 'mount -o remount,ro / ; e2fsck -f -y /dev/mmcblk0p2 ; mount -o remount,rw /'"
-            self.send_command(cmd, True)
-            cmd = f"bash -c 'growpart /dev/mmcblk0 2 -v -u off ; partx -u /dev/mmcblk0 ; resize2fs /dev/mmcblk0p2'"
-            self.send_command(cmd, True)
-            self.send_log_string(f"Finish repair root partition.")
+                elif task == "update_firmware":
+                    self.update_firmware(**kwargs)
+
+                elif task == "set_device_mode":
+                    self.set_new_device_mode(**kwargs)
+
+            except (paramiko.SSHException, socket.error, Exception) as e:
+                self.handle_critical_error(f"Потеряно соединение SSH при выполнении '{task}': {e}")
+        else:
+            self.add_task('EXIT')
+
+    def handle_critical_error(self, error_message):
+        """Метод для безопасной остановки воркера при аварии"""
+        self.is_running = False  # Останавливаем цикл while
+        self.add_task('EXIT')
 
     def update_netplan(self):
         self.send_log_string(f"Changing netplan.")
@@ -609,10 +632,7 @@ class InteractiveSSHWorker(QObject):
         try:
             self.send_log_string(f"Device checking")
             self.send_command('touch cardtest')
-            if 'cardtest' in self.send_command('ls').splitlines():
-                self.send_log_string(f"SD-card is OK")
-                self.send_command('rm cardtest')
-            else:
+            if not self.check_sd_write():
                 #QMessageBox.critical('SD card error', f'{self.EntryDeviceIP.text()}: SD card write error is detected')
                 self.send_log_string(f"SD card write error is detected")
             self.netplan_checker()
@@ -644,19 +664,39 @@ class InteractiveSSHWorker(QObject):
             img_version = ''.join([i for i in img_version if not i.startswith('cat: ')])
             status = f"Image version: {img_version}"
             self.send_log_string(status)
-            status = self.send_command("service synapse-device status | grep 'Active'").strip()
-            self.send_log_string(status)
-            # if chk_state_autoread.get():
-            #    btn_button_area_get_settings_clicked()
+            self.get_services_status()
+            self.get_device_mode()
         except Exception as exc:
             self.send_log_string(f"Problem: {exc}")
+
+    def get_services_status(self):
+        status1 = self.send_command("systemctl is-enabled synapse-device", True).strip()
+        status2 = self.send_command("systemctl is-active synapse-device", True).strip()
+        self.send_log_string(f'Synapse status: {status1} - {status2}')
+        status1 = self.send_command("systemctl is-enabled synapse-dma-audio-driver", True).strip()
+        status2 = self.send_command("systemctl is-active synapse-dma-audio-driver", True).strip()
+        self.send_log_string(f'AES67 status: {status1} - {status2}')
+
+    def get_device_mode(self):
+        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}',True).strip()
+        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}',True).strip()
+        if self.synapse_device_status == 'enabled':
+            if self.dma_driver_status not in ('masked','not-found'):
+                self.send_log_string('DMA driver not masked, fixing')
+                self.send_command(f'bash -c "systemctl disable {self.dma_driver} ; systemctl mask {self.dma_driver}"',True)
+        elif self.dma_driver_status == 'enabled':
+            if self.synapse_device_status not in ('masked','not-found'):
+                self.send_log_string('Synapse device not masked, fixing')
+                self.send_command(f'bash -c "systemctl disable {self.synapse} ; systemctl mask {self.synapse}"', True)
+        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}', True).strip()
+        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}', True).strip()
+        self.device_status_signal.emit(self.synapse_device_status,self.dma_driver_status)
 
     def get_from_dict(self, dictionary=None, dict_key='', default=''):
         if dictionary is None:
             dictionary = dict()
         result = dictionary.get(dict_key, default)
         if not dict_key in dictionary:
-            #QMessageBox.warning('Bad configuration file', f'"{dict_key}" not found\n"Full update" is required')
             self.send_log_string(f'Missed {dict_key}. Full update is required')
         return result
 
@@ -841,6 +881,248 @@ class InteractiveSSHWorker(QObject):
             self.send_log_string(f"Something went wrong. {exc}")
         else:
             self.send_log_string(f"Device settings received")
+
+    def resource_path(self, relative_path):
+        try:
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+        return os.path.join(base_path, relative_path)
+
+    def check_sd_write(self):
+        if self.check_connected():
+            self.send_command('touch cardtest')
+            if not 'cardtest' in self.send_command('ls').splitlines():
+                return False
+            else:
+                self.send_command('rm cardtest')
+                return True
+        else:
+            return False
+
+    def check_and_repair_partition(self):
+        if self.check_connected():
+            cmd = "df -h | grep '/dev/root'"
+            free_space = self.send_command(f'bash -c "{cmd}"', True).strip().split(' ')
+            free = [i for i in free_space if i !=''][4]
+            if '%' in free:
+                free = free.replace('%','')
+                if int(free) > 20:
+                    cmd = f"bash -c 'mount -o remount,ro / ; e2fsck -f -y /dev/mmcblk0p2 ; mount -o remount,rw /'"
+                    self.send_command(cmd, True)
+                    cmd = f"bash -c 'growpart /dev/mmcblk0 2 -v -u off ; partx -u /dev/mmcblk0 ; resize2fs /dev/mmcblk0p2'"
+                    self.send_command(cmd,True)
+                    time.sleep(1)
+                    cmd = "df -h | grep '/dev/root'"
+                    free_space_new = self.send_command(f'bash -c "{cmd}"', True).strip().split(' ')
+                    if free_space_new == free_space:
+                        return False
+                    else:
+                        return True
+                else:
+                    return True
+        else:
+            return False
+
+    def check_sysrq(self):
+        if self.check_connected():
+            if not 'sysrq-trigger' in self.send_command("ls /proc | grep sysrq-trigger").split('\n'):
+                return False
+            else:
+                return True
+        else:
+            return False
+
+    def backup_files_to_boot(self):
+        self.send_command(f"mkdir /boot/uboot/settings", True)
+        self.send_command(f"mkdir /boot/uboot/settings/etc", True)
+        self.send_command(f"cp -r -f /usr/share/synapse/device/storage/ /boot/uboot/settings/", True)
+        self.send_command(f"cp -r -f /etc/netplan/ /boot/uboot/settings/", True)
+        self.send_command(f"cp -f /etc/hostname /boot/uboot/settings/etc/", True)
+        self.send_command(f"cp -f /etc/hosts /boot/uboot/settings/etc/", True)
+        self.send_command(f"cp -r -f /etc/chrony/ /boot/uboot/settings/", True)
+
+    def set_new_device_mode(self,**kwargs):
+        mode = kwargs.get('mode', 1)
+        self.send_log_string('Device mode changing')
+        if self.synapse_device_status != 'not-found' and self.dma_driver_status != 'not-found':
+            stopping_service = None
+            starting_service = None
+            if mode == 1:
+                stopping_service = self.dma_driver
+                starting_service = self.synapse
+                self.send_log_string('Synapse is enabling. Please wait...')
+            elif mode == 2:
+                stopping_service = self.synapse
+                starting_service = self.dma_driver
+                self.send_log_string('AES67 is enabling. Please wait...')
+            cmd1 = f'systemctl stop {stopping_service} ; systemctl disable {stopping_service} ; systemctl mask {stopping_service}'
+            cmd2 = f'systemctl unmask {starting_service} ; systemctl enable {starting_service} ; systemctl restart {starting_service}'
+            self.send_command(f'bash -c "{cmd1}"', True)
+            self.send_command(f'bash -c "{cmd2}"', True)
+            self.send_log_string('Device mode changed')
+
+    def update_firmware(self,**kwargs):
+        filepath = kwargs.get('filepath', '')
+        if filepath != '':
+            if self.check_connected():
+                self.connect_sftp()
+                if self.check_sd_write() and self.check_and_repair_partition():
+                    head, tail = os.path.split(filepath)
+                    if filepath[-4:] == '.deb':
+                        if self.send_sftp(filepath):
+                            tail = tail.replace(' ', '\ ')
+                            tail = tail.replace('(', '\(')
+                            tail = tail.replace(')', '\)')
+                            cmd = f'dpkg -i /home/ubuntu/{tail} ; rm /home/ubuntu/{tail}'
+                            self.send_log_string(f"Installing {tail}")
+                            self.send_command(f"sh -c \"nohup bash -c '{cmd}' > /dev/null 2>&1\"", True)
+                            if 'aes67' in tail:
+                                if 'dma-audio-driver' in self.send_command('ls /usr/share/synapse/').strip().splitlines():
+                                    stor_dir = '/usr/share/synapse/dma-audio-driver/storage/'
+                                    name = 'AppConfig-AppConfig.json'
+                                    if name in self.send_command(f'ls {stor_dir}').strip().splitlines():
+                                        file = self.convert_from_json(self.send_command(f'cat {stor_dir}{name}'))
+                                        if file['value']['RestServer']['Address'] != '0.0.0.0':
+                                            self.send_log_string('Address is changing to 0.0.0.0:9992')
+                                            file['value']['RestServer']['Address'] = '0.0.0.0'
+                                            self.file_to_device(self.convert_to_json(file),name,stor_dir)
+                                            self.send_command(f'systemctl restart {self.dma_driver}')
+                                            self.send_log_string('Device service restarted')
+                            self.send_log_string("Installed")
+                    elif filepath[-4:] == '.tar':
+                        if self.send_sftp(filepath):
+                            self.send_log_string('Installing boot')
+                            self.send_command(
+                                f"bash -c 'rm /boot/uboot/* ; tar -C \"/boot/uboot\" -xvf ./{tail} ; rm ./{tail}'", True)
+                            self.send_log_string('Done. Reboot is needed')
+                    elif filepath[-7:] == '.img.xz':
+                        if self.check_sysrq():
+                            self.send_log_string("Installing img")
+                            self.backup_files_to_boot()
+                            dir = '/tmp/ramdrive/'
+                            self.send_command(f"mkdir {dir}", False)
+                            self.send_command(f"mount -t tmpfs -o size=512M tmpfs {dir}", True)
+                            time.sleep(0.5)
+                            if self.send_sftp(filepath, dir):
+                                self.send_log_string("Preparing...")
+                                size = self.send_command(
+                                    f"xz -l {dir}{tail} | grep '{tail}'").strip().split(' ')
+                                size = [i for i in size if i != '']
+                                max_value_str = str()
+                                for i in size:
+                                    if i == 'MiB' and size[size.index(i) + 2] == 'MiB':
+                                        max_value_str = size[size.index(i) + 1]
+                                        max_value_str = max_value_str[0:max_value_str.index('.')]
+                                        max_value_str = max_value_str.replace(',', '')
+                                        break
+                                max_value : float
+                                if max_value_str != '' and max_value_str.isdigit():
+                                    max_value = float(max_value_str) * 1024 * 1024
+                                else:
+                                    max_value = 3000000000
+                                ro_command = f"service synapse-device stop ; mount -o remount,ro / ; sleep 1 ; mount -o remount,ro /boot/uboot ; sleep 1"
+                                disk = "mmcblk0"
+                                if 'p2.img.xz' in tail:
+                                    disk = "mmcblk0p2"
+                                xz_command = f'xz -dc {dir}{tail} | dd of=/dev/{disk} status=progress > {dir}log 2>&1'
+                                sysrq_command = 'echo b > /proc/sysrq-trigger'
+                                self.send_command(
+                                    f"sh -c \"nohup bash -c '{ro_command} ; {xz_command} ; sleep 30 ; sync ; {sysrq_command}' > /dev/null 2>&1 &\"",True)
+                                time.sleep(0.5)
+                                count,prev_cur_value = 0,0
+                                problem,cur_value_str = '',''
+                                while count < 10:
+                                    try:
+                                        log = self.send_command(f"cat {dir}log", True, None, 6).splitlines()
+                                    except Exception as exc:
+                                        count += 1
+                                    else:
+                                        if len(log) <= 4:
+                                            count += 1
+                                        elif len(log) > 4:
+                                            log = log[-4:]
+                                            cur_value_str = log[-1][0:log[-1].index(' ')]
+                                            if cur_value_str != '' and cur_value_str.isdigit():
+                                                cur_value = float(cur_value_str)
+                                            else:
+                                                cur_value = 0
+                                            proc = f"{(cur_value * 100 // max_value):.0f}"
+                                            self.send_log_string(f"Burning {proc}%",True)
+                                            if 'records in' in log[1]:
+                                                if proc == "100":
+                                                    self.send_log_string("Burning 100%",True)
+                                                    break
+                                                else:
+                                                    count = 10
+                                            count = count + 1 if prev_cur_value == cur_value else 0
+                                            prev_cur_value = cur_value
+                                    time.sleep(3)
+                                if count > 9:
+                                    self.send_log_string("Problem, auto-restart has been planned")
+                                else:
+                                    self.send_command(f"sync", True)
+                                    self.send_log_string("Rebooting...")
+                            else:
+                                self.send_log_string('Problem downloading')
+                        else:
+                            self.send_log_string('No sysrq trigger')
+                    elif filepath[-4:] == '.hex':
+                        if self.send_sftp(self.resource_path('device_flasher_2.out')):
+                            if self.send_sftp(filepath):
+                                self.send_command(f"chmod +x ./device_flasher_2.out", True)
+                                uart_path = '/dev/ttyUL2' if 'ttyUL2' in self.send_command(f"ls /dev/tty*", True) else '/dev/ttyPS1'
+                                if 'TR804F' in tail:
+                                    self.send_log_string('Update FP...')
+                                    cmd = f"service synapse-device stop ; ./device_flasher_2.out UART={uart_path} FRONT=./{tail}"
+                                    self.send_command(f"sh -c \"nohup bash -c '{cmd}'\"", True,None,300)
+                                elif 'TR804DECT' in tail or 'TR807DECT' in tail:
+                                    if 'TR804DECT' in tail:
+                                        dev,cmd_type = '4','DECT'
+                                    else:
+                                        dev, cmd_type = '2', 'TR807'
+                                    self.send_log_string('Update DECT...')
+                                    cmd_cycle = 'for slot in {1..'+ dev + '}; do ' + f'./device_flasher_2.out UART={uart_path} ' + 'SLOT=\${slot} ' + f'{cmd_type}=./{tail} > /dev/null 2>&1 ; done'
+                                    cmd = f'service synapse-device stop ; {cmd_cycle} ; rm ./device_flasher_2.out ; rm ./{tail}'
+                                    try:
+                                        self.send_command(f"sh -c \"nohup bash -c '{cmd}' > /dev/null 2>&1\"", True,None,300)
+                                    except:
+                                        ...
+                        else:
+                            self.send_log_string('No device_flasher_2.out found')
+                    elif filepath[-4:] == '.bin':
+                        if 'dect_bs_arm' in tail:
+                            flasher_type = 'artery_flasher.updater'
+                            erase_cmd = './artery_flasher.updater -p /dev/ttyPS1 -f A32F4 -e'
+                            write_cmd = f'./artery_flasher.updater -p /dev/ttyPS1 -f A32F4 -v -V -w ./{tail}'
+                            self.send_log_string('Update Artery...')
+                        elif 'dect_fp_fpga' in tail:
+                            flasher_type = 'fpga_flasher.updater'
+                            erase_cmd = './fpga_flasher.updater -p /dev/ttyPS1 -s 115200 -e'
+                            write_cmd = f'./fpga_flasher.updater -p /dev/ttyPS1 -s 115200 -f ./{tail}'
+                            self.send_log_string('Update FPGA...')
+                        else:
+                            flasher_type,erase_cmd,write_cmd = '','',''
+                            self.send_log_string('Wrong bin file')
+                        if flasher_type != '':
+                            if self.send_sftp(self.resource_path(flasher_type)):
+                                self.send_command(f"chmod +x ./{flasher_type}", True)
+                                if self.send_sftp(filepath):
+                                    cmd = f'service synapse-device stop ; {erase_cmd} ; {write_cmd} ; rm ./{flasher_type} ; rm ./{tail}'
+                                    try:
+                                        self.send_command(f"sh -c \"nohup bash -c '{cmd}' > {flasher_type}.log 2>&1\"", True,None,300)
+                                    except:
+                                        ...
+                                    self.send_log_string('Rebooting...')
+                                    self.add_task('EXIT')
+                        else:
+                            self.send_log_string('No DECTv2')
+                    else:
+                        self.send_log_string('No transmit')
+                else:
+                    self.send_log_string('Prt: BAD')
+            else:
+                self.send_log_string('Can not connect')
 
     def convert_from_yaml(self, data):
         return yaml.safe_load(data)
@@ -1177,24 +1459,28 @@ class SynapseDevice:
         self.ButtonStatus = QPushButton('Status service')
         self.ButtonReboot = QPushButton('Reboot device')
         self.ButtonRepairPartition = QPushButton('Repair partition')
+        self.SetDeviceMode = QPushButton('Set device mode')
         self.ComboBoxDeviceMode = QComboBox()
-        self.ComboBoxDeviceMode.addItems(['Synapse device','AES67 Node'])
+        self.ComboBoxDeviceMode.addItems(['','Synapse device','AES67 Node'])
         self.ComboBoxDeviceMode.setEditable(False)
+        self.ComboBoxDeviceMode.model().item(0).setEnabled(False)
 
         self.ButtonRestart.clicked.connect(lambda: self.send_command('restart_service'))
         self.ButtonStop.clicked.connect(lambda: self.send_command('stop_service'))
         self.ButtonStatus.clicked.connect(lambda: self.send_command('status_service'))
         self.ButtonReboot.clicked.connect(lambda: self.send_command('reboot_device'))
         self.ButtonRepairPartition.clicked.connect(lambda: self.send_command('repair_partition'))
+        self.SetDeviceMode.clicked.connect(self.set_device_mode)
 
         current_row = 0
 
         layout_controls_tab_3.addWidget(QLabel('Device mode: '), current_row,0,Qt.AlignmentFlag.AlignRight)
         layout_controls_tab_3.addWidget(self.ComboBoxDeviceMode,current_row,1)
-        layout_controls_tab_3.addWidget(self.ButtonReboot, current_row, 2)
+        layout_controls_tab_3.addWidget(self.SetDeviceMode, current_row, 2)
 
         current_row += 1
 
+        layout_controls_tab_3.addWidget(self.ButtonReboot, current_row, 1)
         layout_controls_tab_3.addWidget(self.ButtonRepairPartition, current_row, 2)
 
         current_row += 1
@@ -1213,8 +1499,10 @@ class SynapseDevice:
 
         self.LabelFileName = QLabel("Filename:")
         self.ButtonOpenFile = QPushButton('Open file')
+        self.ButtonInstall = QPushButton('Install')
 
         self.ButtonOpenFile.clicked.connect(self.open_file)
+        self.ButtonInstall.clicked.connect(self.update_firmware)
 
         current_row = 0
 
@@ -1223,6 +1511,7 @@ class SynapseDevice:
         current_row += 1
 
         layout_controls_tab_4.addWidget(self.ButtonOpenFile, current_row, 0,1,2)
+        layout_controls_tab_4.addWidget(self.ButtonInstall, current_row, 2, 1, 2)
 
         self.settings_tabs.addTab(controls_tab_4, "Firmware")
 
@@ -1251,7 +1540,7 @@ class SynapseDevice:
             boot_filter = 'TR807BOOT*.tar'
             hex_filter = 'TR807*.hex'
             img_filter = 'TR807*p2.img.xz'
-        filters = f"(synapse-device*.deb dect_bs_arm*.bin dect_fp_fpga*.bin {hex_filter} {boot_filter} {img_filter})"
+        filters = f"(synapse-device*.deb synapse-x-media-dma*.deb dect_bs_arm*.bin dect_fp_fpga*.bin {hex_filter} {boot_filter} {img_filter})"
         self.update_filepath = self.select_file(self.CentralWidget,"Open file","",filters)
         if self.update_filepath:
             self.LabelFileName.setText(f"Filename: {os.path.basename(self.update_filepath)}")
@@ -1269,6 +1558,22 @@ class SynapseDevice:
         if self.thread is not None:
             if self.worker is not None:
                 self.dict_to_entry(self.worker.default_settings)
+        else:
+            self.update_txt_area('Not connected')
+
+    def set_device_mode(self):
+        if self.thread is not None:
+            if self.worker is not None:
+                self.worker.add_task('set_device_mode',mode=self.ComboBoxDeviceMode.currentIndex())
+        else:
+            self.update_txt_area('Not connected')
+
+    def update_firmware(self):
+        if self.thread is not None:
+            if self.worker is not None:
+                self.worker.add_task('update_start')
+                self.worker.add_task('update_firmware',filepath=self.update_filepath)
+                self.worker.add_task('update_finish')
         else:
             self.update_txt_area('Not connected')
 
@@ -1304,6 +1609,7 @@ class SynapseDevice:
             self.worker.buttons_state_signal.connect(self.update_buttons_state)
             self.worker.request_decision.connect(self.show_confirmation_dialog)
             self.worker.update_entry.connect(self.dict_to_entry)
+            self.worker.device_status_signal.connect(self.update_device_mode)
 
             self.worker.finished_signal.connect(self.thread.quit)
             self.thread.finished.connect(self.on_disconnected)
@@ -1311,7 +1617,7 @@ class SynapseDevice:
 
             self.thread.start()
         else:
-            self.worker.stop()
+            self.worker.add_task('EXIT')
 
     def on_disconnected(self):
         self.worker = None
@@ -1435,6 +1741,29 @@ class SynapseDevice:
             self.update_buttons_state('lock_update')
         else:
             self.update_buttons_state('unlock_update')
+
+    def update_device_mode(self,synapse_state,dma_state):
+        syn_st,dma_st = True,True
+        if 'not-found' in synapse_state:
+            syn_st = False
+        if 'not-found' in dma_state:
+            dma_st = False
+        self.ComboBoxDeviceMode.model().item(1).setEnabled(syn_st)
+        self.ComboBoxDeviceMode.model().item(2).setEnabled(dma_st)
+        has_active = False
+        for i in range(1, self.ComboBoxDeviceMode.count()):
+            if self.ComboBoxDeviceMode.model().item(i).isEnabled():
+                has_active = True
+                self.ComboBoxDeviceMode.model().item(0).setEnabled(False)
+                self.ComboBoxDeviceMode.model().item(0).setText('')
+        if not has_active:
+            self.ComboBoxDeviceMode.model().item(0).setEnabled(True)
+            self.ComboBoxDeviceMode.model().item(0).setText('Not installed')
+            self.ComboBoxDeviceMode.setCurrentIndex(0)
+        if synapse_state == 'enabled':
+            self.ComboBoxDeviceMode.setCurrentIndex(1)
+        elif dma_state == 'enabled':
+            self.ComboBoxDeviceMode.setCurrentIndex(2)
 
     def update_buttons_state(self,state):
         if state == 'connecting':
