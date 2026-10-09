@@ -397,10 +397,11 @@ class InteractiveSSHWorker(QObject):
                         self.add_task("status_service")
 
                 elif task == "status_service":
-                    service = 'Synapse device' if self.current_device_service == self.synapse else 'AES67 device'
                     if self.current_device_service != '':
-                        status = self.send_command(f'systemctl status {self.current_device_service} | grep "Active:"',True).strip()
-                        self.send_log_string(f'{service}: {status}')
+                        service = 'Synapse device' if self.current_device_service == self.synapse else 'AES67 device'
+                        if self.current_device_service != '':
+                            status = self.send_command(f'systemctl status {self.current_device_service} | grep "Active:"',True).strip()
+                            self.send_log_string(f'{service}: {status}')
 
                 elif task == "reboot_device":
                     self.send_log_string(f"Checking FS before reboot. Please wait")
