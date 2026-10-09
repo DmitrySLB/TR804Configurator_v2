@@ -43,6 +43,7 @@ class InteractiveSSHWorker(QObject):
         self.dma_driver_status = ''
         self.synapse = 'synapse-device'
         self.dma_driver = 'synapse-dma-audio-driver'
+        self.current_device_service = ''
 
         self.jump_client = paramiko.SSHClient()
         self.jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -372,19 +373,34 @@ class InteractiveSSHWorker(QObject):
                 elif task == "update_finish":
                     self.send_log_string("Update finish. Reboot is needed")
 
+                elif task == "check_enabled_device":
+                    status1, _ = self.get_service_status(self.synapse)
+                    status2, _ = self.get_service_status(self.dma_driver)
+                    self.current_device_service = ''
+                    if status1 == 'enabled' and status2 != 'enabled':
+                        self.current_device_service = self.synapse
+                    elif status1 != 'enabled' and status2 == 'enabled':
+                        self.current_device_service = self.dma_driver
+
                 elif task == "restart_service":
-                    self.send_log_string("Service is restarting...")
-                    self.send_command('systemctl restart synapse-device',True)
-                    self.add_task("status_service")
+                    if self.current_device_service != '':
+                        service = 'Synapse device' if self.current_device_service == self.synapse else 'AES67 device'
+                        self.send_log_string(f"{service} is restarting...")
+                        self.send_command(f'systemctl restart {self.current_device_service}', True)
+                        self.add_task("status_service")
 
                 elif task == "stop_service":
-                    self.send_log_string("Service is stoping...")
-                    self.send_command('systemctl stop synapse-device',True)
-                    self.add_task("status_service")
+                    if self.current_device_service != '':
+                        service = 'Synapse device' if self.current_device_service == self.synapse else 'AES67 device'
+                        self.send_log_string(f"{service} is stopping...")
+                        self.send_command(f'systemctl stop {self.current_device_service}',True)
+                        self.add_task("status_service")
 
                 elif task == "status_service":
-                    status = self.send_command('systemctl status synapse-device | grep "Active:"',True).strip()
-                    self.send_log_string(status)
+                    service = 'Synapse device' if self.current_device_service == self.synapse else 'AES67 device'
+                    if self.current_device_service != '':
+                        status = self.send_command(f'systemctl status {self.current_device_service} | grep "Active:"',True).strip()
+                        self.send_log_string(f'{service}: {status}')
 
                 elif task == "reboot_device":
                     self.send_log_string(f"Checking FS before reboot. Please wait")
@@ -664,22 +680,23 @@ class InteractiveSSHWorker(QObject):
             img_version = ''.join([i for i in img_version if not i.startswith('cat: ')])
             status = f"Image version: {img_version}"
             self.send_log_string(status)
-            self.get_services_status()
+            status1,status2 = self.get_service_status(self.synapse)
+            self.send_log_string(f'Synapse status: {status1} - {status2}')
+            status1,status2 = self.get_service_status(self.dma_driver)
+            self.send_log_string(f'AES67 status: {status1} - {status2}')
             self.get_device_mode()
         except Exception as exc:
             self.send_log_string(f"Problem: {exc}")
 
-    def get_services_status(self):
-        status1 = self.send_command("systemctl is-enabled synapse-device", True).strip()
-        status2 = self.send_command("systemctl is-active synapse-device", True).strip()
-        self.send_log_string(f'Synapse status: {status1} - {status2}')
-        status1 = self.send_command("systemctl is-enabled synapse-dma-audio-driver", True).strip()
-        status2 = self.send_command("systemctl is-active synapse-dma-audio-driver", True).strip()
-        self.send_log_string(f'AES67 status: {status1} - {status2}')
+    def get_service_status(self,service_name):
+        status1 = self.send_command(f"systemctl is-enabled {service_name}").strip()
+        status2 = self.send_command(f"systemctl is-active {service_name}").strip()
+        status1 = 'not-found' if status1 not in ('enabled','disabled','masked') else status1
+        return status1,status2
 
     def get_device_mode(self):
-        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}',True).strip()
-        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}',True).strip()
+        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}').strip()
+        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}').strip()
         if self.synapse_device_status == 'enabled':
             if self.dma_driver_status not in ('masked','not-found'):
                 self.send_log_string('DMA driver not masked, fixing')
@@ -688,8 +705,8 @@ class InteractiveSSHWorker(QObject):
             if self.synapse_device_status not in ('masked','not-found'):
                 self.send_log_string('Synapse device not masked, fixing')
                 self.send_command(f'bash -c "systemctl disable {self.synapse} ; systemctl mask {self.synapse}"', True)
-        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}', True).strip()
-        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}', True).strip()
+        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}').strip()
+        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}').strip()
         self.device_status_signal.emit(self.synapse_device_status,self.dma_driver_status)
 
     def get_from_dict(self, dictionary=None, dict_key='', default=''):
@@ -1302,7 +1319,7 @@ class SynapseDevice:
         self.EntryServerAIP1.editingFinished.connect(lambda: self.ip_validation(self.EntryServerAIP1))
         self.EntryServerAIP2.editingFinished.connect(lambda: self.ip_validation(self.EntryServerAIP2))
         self.EntryServerBIP1.editingFinished.connect(lambda: self.ip_validation(self.EntryServerBIP1))
-        self.EntryServerBIP1.editingFinished.connect(lambda: self.ip_validation(self.EntryServerBIP1))
+        self.EntryServerBIP2.editingFinished.connect(lambda: self.ip_validation(self.EntryServerBIP2))
         self.EntryDeviceMask1.editingFinished.connect(lambda: self.mask_validation(self.EntryDeviceMask1))
         self.EntryDeviceMask2.editingFinished.connect(lambda: self.mask_validation(self.EntryDeviceMask2))
         self.EntryServerMask1.editingFinished.connect(lambda: self.mask_validation(self.EntryServerMask1))
@@ -1550,6 +1567,7 @@ class SynapseDevice:
     def send_command(self,command):
         if self.thread is not None:
             if self.worker is not None:
+                self.worker.add_task('check_enabled_device')
                 self.worker.add_task(command)
         else:
             self.update_txt_area('Not connected')
@@ -1666,7 +1684,8 @@ class SynapseDevice:
             is_dhcp_2 = (line_edit is self.EntryDeviceIP2 and self.CheckBoxDHCP2.isChecked())
             is_gw1 = line_edit is self.EntryDeviceGW1
             is_gw2 = line_edit is self.EntryDeviceGW2
-            if not (is_dhcp_1 or is_dhcp_2 or is_gw1 or is_gw2):
+            is_srv = line_edit in (self.EntryServerAIP1,self.EntryServerAIP2,self.EntryServerBIP1,self.EntryServerBIP2)
+            if not (is_dhcp_1 or is_dhcp_2 or is_gw1 or is_gw2 or is_srv):
                 is_error = True
         line_edit.setProperty("error", is_error)
         line_edit.setText(new_ip)
