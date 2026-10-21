@@ -33,6 +33,7 @@ class InteractiveSSHWorker(QObject):
     update_entry = pyqtSignal(dict)
     finished_signal = pyqtSignal()  # Вызывается только при полном отключении
     device_status_signal = pyqtSignal(str,str)
+    renderer_status_signal = pyqtSignal(int)
 
     def __init__(self,host,port,jump_flag,jump_host,jump_port,jump_user,jump_pass,user,secret):
         super().__init__()
@@ -436,6 +437,9 @@ class InteractiveSSHWorker(QObject):
                 elif task == "set_device_mode":
                     self.set_new_device_mode(**kwargs)
 
+                elif task == "set_renderer":
+                    self.set_new_renderer(**kwargs)
+
             except (paramiko.SSHException, socket.error, Exception) as e:
                 self.handle_critical_error(f"Потеряно соединение SSH при выполнении '{task}': {e}")
         else:
@@ -685,6 +689,7 @@ class InteractiveSSHWorker(QObject):
             self.send_log_string(f'Synapse status: {status1} - {status2}')
             status1,status2 = self.get_service_status(self.dma_driver)
             self.send_log_string(f'AES67 status: {status1} - {status2}')
+            self.get_renderer()
             self.get_device_mode()
         except Exception as exc:
             self.send_log_string(f"Problem: {exc}")
@@ -694,6 +699,10 @@ class InteractiveSSHWorker(QObject):
         status2 = self.send_command(f"systemctl is-active {service_name}").strip()
         status1 = 'not-found' if status1 not in ('enabled','disabled','masked') else status1
         return status1,status2
+
+    def get_renderer(self):
+        render = 2 if self.send_command(f'systemctl is-active systemd-networkd').strip() == 'active' else 1
+        self.renderer_status_signal.emit(render)
 
     def get_device_mode(self):
         self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}').strip()
@@ -960,9 +969,24 @@ class InteractiveSSHWorker(QObject):
         self.send_command(f"cp -f /etc/hosts /boot/uboot/settings/etc/", True)
         self.send_command(f"cp -r -f /etc/chrony/ /boot/uboot/settings/", True)
 
+    def set_new_renderer(self,**kwargs):
+        renderer = kwargs.get('renderer', 2)
+        self.send_log_string('Renderer is changing...')
+        netplans = self.send_command('ls /etc/netplan/').strip().splitlines()
+        if renderer == 1:
+            self.send_log_string('NetworkManager is enabling...')
+            cmd1 = f"sed -i 's/renderer: networkd/renderer: NetworkManager/' /etc/netplan/*.yaml"
+            cmd2 = f'systemctl disable systemd-networkd ; systemctl enable NetworkManager'
+        else:
+            self.send_log_string('networkd is enabling...')
+            cmd1 = f"sed -i 's/renderer: NetworkManager/renderer: networkd/' /etc/netplan/*.yaml"
+            cmd2 = f'systemctl disable NetworkManager ; systemctl enable systemd-networkd'
+        self.send_command(f'bash -c "{cmd1} ; {cmd2}"', True)
+        self.send_log_string('Renderer changed. Reboot is needed')
+
     def set_new_device_mode(self,**kwargs):
         mode = kwargs.get('mode', 1)
-        self.send_log_string('Device mode changing')
+        self.send_log_string('Device mode is changing...')
         if self.synapse_device_status != 'not-found' and self.dma_driver_status != 'not-found':
             stopping_service = None
             starting_service = None
@@ -1308,9 +1332,9 @@ class SynapseDevice:
         self.EntryServerBIP2 = self.create_qlineedit(True,True,'192.168.188.11', 'Server B IP-address 2')
         self.EntryServerMask1 = self.create_qlineedit(True,True,'255.255.255.0', 'xxx.xxx.xxx.xxx or xx')
         self.EntryServerMask2 = self.create_qlineedit(True,True,'255.255.255.0', 'xxx.xxx.xxx.xxx or xx')
-        self.ButtonReadDevice = QPushButton("Read device")
-        self.ButtonDefaultSettings = QPushButton("Default settings")
-        self.ButtonFullUpdate1 = QPushButton("Update")
+        self.ButtonReadDevice = self.create_qpushbutton(True,"Read device")
+        self.ButtonDefaultSettings = self.create_qpushbutton(True,"Default settings")
+        self.ButtonFullUpdate1 = self.create_qpushbutton(True,"Update")
 
         self.ButtonFullUpdate1.clicked.connect(self.update_device)
         self.ButtonReadDevice.clicked.connect(self.read_device)
@@ -1390,22 +1414,20 @@ class SynapseDevice:
         self.EntryDeviceGW2 = self.create_qlineedit(True,True,'', 'Gateway 2 IP-address')
         self.EntryServerAPort = self.create_qlineedit(True,True,'15351', 'Server A port')
         self.EntryServerBPort = self.create_qlineedit(True,True,'15351', 'Server B port')
-        self.CheckBoxDHCP1 = self.create_qcheckbox('LAN1')
-        self.CheckBoxDHCP2 = self.create_qcheckbox('LAN2')
-        self.CheckBoxGateWay4 = self.create_qcheckbox()
-        self.CheckBoxSecureTCP = self.create_qcheckbox()
-        self.CheckBoxTimeServers = self.create_qcheckbox('Timeservers:')
-        self.CheckBoxSilenceDetector = self.create_qcheckbox()
-        self.CheckBoxUseUL2 = self.create_qcheckbox()
-        self.CheckBoxDectOff = self.create_qcheckbox()
-        self.SpinBoxSilenceDetector = QDoubleSpinBox()
-        self.SpinBoxSilenceDetector.setRange(-90.0, 0.0)
-        self.SpinBoxSilenceDetector.setSingleStep(0.1)
+        self.CheckBoxDHCP1 = self.create_qcheckbox(True,'LAN1')
+        self.CheckBoxDHCP2 = self.create_qcheckbox(True,'LAN2')
+        self.CheckBoxGateWay4 = self.create_qcheckbox(True)
+        self.CheckBoxSecureTCP = self.create_qcheckbox(True)
+        self.CheckBoxTimeServers = self.create_qcheckbox(True,'Timeservers:')
+        self.CheckBoxSilenceDetector = self.create_qcheckbox(True)
+        self.CheckBoxUseUL2 = self.create_qcheckbox(True)
+        self.CheckBoxDectOff = self.create_qcheckbox(True)
+        self.SpinBoxSilenceDetector = self.create_qdoublespinbox(True,-90.0,0.0,0.1)
         self.EntrySilenceTime = self.create_qlineedit(False,True,'3000', 'Detection time, ms')
         self.EntrySilenceTime.setValidator(QIntValidator(0, 300000))
         self.EntryTimeServers = self.create_qlineedit(False,False,'', 'xxx.xxx.xxx.xxx,yyy.yyy.yyy.yyy')
         self.EntryTimeServers.setEnabled(False)
-        self.ButtonFullUpdate2 = QPushButton("Update")
+        self.ButtonFullUpdate2 = self.create_qpushbutton(True,"Update")
 
         self.ButtonFullUpdate2.clicked.connect(self.update_device)
         self.CheckBoxDHCP1.toggled.connect(lambda: self.EntryDeviceIP1.editingFinished.emit())
@@ -1472,15 +1494,16 @@ class SynapseDevice:
         layout_controls_tab_3.setContentsMargins(*self.MarginsContent)
         layout_controls_tab_3.setSpacing(2)
 
-        self.ButtonRestart = QPushButton('Restart service')
-        self.ButtonStop = QPushButton('Stop service')
-        self.ButtonStatus = QPushButton('Status service')
-        self.ButtonReboot = QPushButton('Reboot device')
-        self.ButtonRepairPartition = QPushButton('Repair partition')
-        self.SetDeviceMode = QPushButton('Set device mode')
-        self.ComboBoxDeviceMode = QComboBox()
-        self.ComboBoxDeviceMode.addItems(['','Synapse device','AES67 Node'])
-        self.ComboBoxDeviceMode.setEditable(False)
+        self.ButtonRestart = self.create_qpushbutton(True,'Restart service')
+        self.ButtonStop = self.create_qpushbutton(True,'Stop service')
+        self.ButtonStatus = self.create_qpushbutton(True,'Status service')
+        self.ButtonReboot = self.create_qpushbutton(True,'Reboot device')
+        self.ButtonRepairPartition = self.create_qpushbutton(True,'Repair partition')
+        self.SetDeviceMode = self.create_qpushbutton(True,'Set device mode')
+        self.SetRenderer = self.create_qpushbutton(True,'Set renderer')
+        self.ComboBoxRenderer = self.create_qcombobox(True,['','NetworkManager','networkd'],False)
+        self.ComboBoxRenderer.model().item(0).setEnabled(False)
+        self.ComboBoxDeviceMode = self.create_qcombobox(True,['','Synapse device','AES67 Node'],False)
         self.ComboBoxDeviceMode.model().item(0).setEnabled(False)
 
         self.ButtonRestart.clicked.connect(lambda: self.send_command('restart_service'))
@@ -1489,8 +1512,15 @@ class SynapseDevice:
         self.ButtonReboot.clicked.connect(lambda: self.send_command('reboot_device'))
         self.ButtonRepairPartition.clicked.connect(lambda: self.send_command('repair_partition'))
         self.SetDeviceMode.clicked.connect(self.set_device_mode)
+        self.SetRenderer.clicked.connect(self.set_renderer)
 
         current_row = 0
+
+        layout_controls_tab_3.addWidget(QLabel('Network renderer: '), current_row, 0, Qt.AlignmentFlag.AlignRight)
+        layout_controls_tab_3.addWidget(self.ComboBoxRenderer, current_row, 1)
+        layout_controls_tab_3.addWidget(self.SetRenderer, current_row, 2)
+
+        current_row += 1
 
         layout_controls_tab_3.addWidget(QLabel('Device mode: '), current_row,0,Qt.AlignmentFlag.AlignRight)
         layout_controls_tab_3.addWidget(self.ComboBoxDeviceMode,current_row,1)
@@ -1516,8 +1546,8 @@ class SynapseDevice:
         layout_controls_tab_4.setSpacing(2)
 
         self.LabelFileName = QLabel("Filename:")
-        self.ButtonOpenFile = QPushButton('Open file')
-        self.ButtonInstall = QPushButton('Install')
+        self.ButtonOpenFile = self.create_qpushbutton(True,'Open file')
+        self.ButtonInstall = self.create_qpushbutton(True,'Install')
 
         self.ButtonOpenFile.clicked.connect(self.open_file)
         self.ButtonInstall.clicked.connect(self.update_firmware)
@@ -1580,6 +1610,13 @@ class SynapseDevice:
         else:
             self.update_txt_area('Not connected')
 
+    def set_renderer(self):
+        if self.thread is not None:
+            if self.worker is not None:
+                self.worker.add_task('set_renderer',renderer=self.ComboBoxRenderer.currentIndex())
+        else:
+            self.update_txt_area('Not connected')
+
     def set_device_mode(self):
         if self.thread is not None:
             if self.worker is not None:
@@ -1629,6 +1666,7 @@ class SynapseDevice:
             self.worker.request_decision.connect(self.show_confirmation_dialog)
             self.worker.update_entry.connect(self.dict_to_entry)
             self.worker.device_status_signal.connect(self.update_device_mode)
+            self.worker.renderer_status_signal.connect(self.update_renderer)
 
             self.worker.finished_signal.connect(self.thread.quit)
             self.thread.finished.connect(self.on_disconnected)
@@ -1761,6 +1799,9 @@ class SynapseDevice:
             self.update_buttons_state('lock_update')
         else:
             self.update_buttons_state('unlock_update')
+
+    def update_renderer(self,renderer):
+        self.ComboBoxRenderer.setCurrentIndex(renderer)
 
     def update_device_mode(self,synapse_state,dma_state):
         syn_st,dma_st = True,True
@@ -1935,10 +1976,34 @@ class SynapseDevice:
             self.ValidateLineEdits.append(new_entry)
         return new_entry
 
-    def create_qcheckbox(self, text='', chk_state=False, ) -> QCheckBox:
+    def create_qcheckbox(self, need_disable=False, text='', chk_state=False) -> QCheckBox:
         new_chk = QCheckBox(text)
         new_chk.setChecked(chk_state)
+        if need_disable:
+            self.AllDisablableElements.append(new_chk)
         return new_chk
+
+    def create_qcombobox(self, need_disable : bool, items : list, editable : bool) -> QComboBox:
+        new_combox = QComboBox()
+        new_combox.addItems(items)
+        new_combox.setEditable(editable)
+        if need_disable:
+            self.AllDisablableElements.append(new_combox)
+        return new_combox
+
+    def create_qpushbutton(self, need_disable: bool, text : str) -> QPushButton:
+        new_button = QPushButton(text)
+        if need_disable:
+            self.AllDisablableElements.append(new_button)
+        return new_button
+
+    def create_qdoublespinbox(self,need_disable: bool, min_value : float,max_value : float,step : float) -> QDoubleSpinBox:
+        new_dsb = QDoubleSpinBox()
+        new_dsb.setRange(min_value, max_value)
+        new_dsb.setSingleStep(step)
+        if need_disable:
+            self.AllDisablableElements.append(new_dsb)
+        return new_dsb
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -1946,7 +2011,7 @@ if __name__ == "__main__":
     app.setStyle('Fusion')
 
     window = QMainWindow()
-    window.setWindowTitle("TR-804 configurator 26.08.2026")
+    window.setWindowTitle("TR-804 configurator 21.10.2026")
     # self.resize(550, 600)
     # self.setMinimumSize(450, 500)
 
