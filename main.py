@@ -405,13 +405,14 @@ class InteractiveSSHWorker(QObject):
                             self.send_log_string(f'{service}: {status}')
 
                 elif task == "reboot_device":
-                    self.send_log_string(f"Checking FS before reboot. Please wait")
-                    self.send_command("rm /home/ubuntu/partition_extended", False)
-                    self.send_command("mount -o remount,ro /", True)
-                    self.send_command("fsck -y /dev/mmcblk0p2", True)
-                    self.send_log_string(f"Rebooting")
-                    self.send_command("reboot", True)
-                    self.add_task("EXIT")
+                    if self.ask_user_dialog("Device rebooting","Reboot device?"):
+                        self.send_log_string(f"Checking FS before reboot. Please wait")
+                        self.send_command("rm /home/ubuntu/partition_extended", False)
+                        self.send_command("mount -o remount,ro /", True)
+                        self.send_command("fsck -y /dev/mmcblk0p2", True)
+                        self.send_log_string(f"Rebooting")
+                        self.send_command("reboot", True)
+                        self.add_task("EXIT")
 
                 elif task == "update_netplan":
                     self.update_netplan()
@@ -705,8 +706,8 @@ class InteractiveSSHWorker(QObject):
         self.renderer_status_signal.emit(render)
 
     def get_device_mode(self):
-        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}').strip()
-        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}').strip()
+        self.synapse_device_status,_ = self.get_service_status(self.synapse)
+        self.dma_driver_status,_ = self.get_service_status(self.dma_driver)
         if self.synapse_device_status == 'enabled':
             if self.dma_driver_status not in ('masked','not-found'):
                 self.send_log_string('DMA driver not masked, fixing')
@@ -715,8 +716,8 @@ class InteractiveSSHWorker(QObject):
             if self.synapse_device_status not in ('masked','not-found'):
                 self.send_log_string('Synapse device not masked, fixing')
                 self.send_command(f'bash -c "systemctl disable {self.synapse} ; systemctl mask {self.synapse}"', True)
-        self.synapse_device_status = self.send_command(f'systemctl is-enabled {self.synapse}').strip()
-        self.dma_driver_status = self.send_command(f'systemctl is-enabled {self.dma_driver}').strip()
+        self.synapse_device_status,_ = self.get_service_status(self.synapse)
+        self.dma_driver_status,_ = self.get_service_status(self.dma_driver)
         self.device_status_signal.emit(self.synapse_device_status,self.dma_driver_status)
 
     def get_from_dict(self, dictionary=None, dict_key='', default=''):
@@ -1152,13 +1153,15 @@ class InteractiveSSHWorker(QObject):
                                 if self.send_sftp(filepath):
                                     cmd = f'service synapse-device stop ; {erase_cmd} ; {write_cmd} ; rm ./{flasher_type} ; rm ./{tail}'
                                     try:
+                                        self.send_log_string('Update started...')
                                         self.send_command(f"sh -c \"nohup bash -c '{cmd}' > {flasher_type}.log 2>&1\"", True,None,300)
+                                        last_string = self.send_command(f"cat ./{flasher_type}.log").strip().splitlines()[-1]
+                                        self.send_log_string(f'Updating finished...{last_string}')
+                                        del last_string
                                     except:
                                         ...
-                                    self.send_log_string('Rebooting...')
-                                    self.add_task('EXIT')
-                        else:
-                            self.send_log_string('No DECTv2')
+                                    self.send_log_string('Done. Reboot is needed')
+                                    #self.add_task('EXIT')
                     else:
                         self.send_log_string('No transmit')
                 else:
@@ -1215,7 +1218,7 @@ class SynapseDevice:
         self.worker : InteractiveSSHWorker
         self.thread = None
         self.worker = None
-        self.isTr804 = True
+        self.isTr804 = False
         self.update_filepath = ''
 
         self.init_ui()
@@ -1580,14 +1583,17 @@ class SynapseDevice:
         self.change_elements_state(False)
 
     def open_file(self):
-        if self.isTr804:
+        '''if self.isTr804:
             boot_filter = 'TR804BOOT*.tar'
             hex_filter = 'TR804*.hex'
             img_filter = 'TR804*p2.img.xz'
         else:
             boot_filter = 'TR807BOOT*.tar'
             hex_filter = 'TR807*.hex'
-            img_filter = 'TR807*p2.img.xz'
+            img_filter = 'TR807*p2.img.xz'''
+        boot_filter = 'TR80*BOOT*.tar'
+        hex_filter = 'TR80*.hex'
+        img_filter = 'TR80*p2.img.xz'
         filters = f"(synapse-device*.deb synapse-x-media-dma*.deb dect_bs_arm*.bin dect_fp_fpga*.bin {hex_filter} {boot_filter} {img_filter})"
         self.update_filepath = self.select_file(self.CentralWidget,"Open file","",filters)
         if self.update_filepath:
@@ -2011,7 +2017,7 @@ if __name__ == "__main__":
     app.setStyle('Fusion')
 
     window = QMainWindow()
-    window.setWindowTitle("TR-804 configurator 21.10.2026")
+    window.setWindowTitle("TR-804 configurator 23.10.2026")
     # self.resize(550, 600)
     # self.setMinimumSize(450, 500)
 
